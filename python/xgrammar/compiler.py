@@ -111,6 +111,7 @@ class GrammarCompiler(XGRObject):
         max_threads: int = 8,
         cache_enabled: bool = True,
         cache_limit_bytes: int = -1,
+        compile_timeout_ms: int = -1,
     ):
         """Construct the compiler.
 
@@ -128,6 +129,15 @@ class GrammarCompiler(XGRObject):
         cache_limit_bytes : int, default: -1
             The maximum memory usage for the cache in the specified unit.
             Note that the actual memory usage may slightly exceed this value.
+
+        compile_timeout_ms : int, default: -1
+            The time budget in milliseconds for every compile method on this compiler.
+            Token-mask precomputation costs FSM-states x vocab-size; some grammars (e.g.
+            long chains of optional rules) blow up the state count and would otherwise
+            compile for minutes with no way to abort. When the budget is exceeded, the
+            compile aborts cooperatively and raises an error of kind CompileTimeoutError;
+            the partial result is discarded and the grammar is not cached, so a later
+            call may retry. -1 means no timeout.
         """
         if not isinstance(tokenizer_info, TokenizerInfo):
             raise ValueError(
@@ -137,7 +147,11 @@ class GrammarCompiler(XGRObject):
 
         self._init_handle(
             _core.GrammarCompiler(
-                tokenizer_info._handle, max_threads, cache_enabled, cache_limit_bytes
+                tokenizer_info._handle,
+                max_threads,
+                cache_enabled,
+                cache_limit_bytes,
+                compile_timeout_ms,
             )
         )
 
