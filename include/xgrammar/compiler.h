@@ -63,12 +63,19 @@ class GrammarCompiler {
    * \param max_threads The maximum number of threads to use for compiling grammars.
    * \param cache_enabled Whether to enable the cache.
    * \param max_memory_bytes The maximum memory usage in bytes.
+   * \param compile_timeout_ms The time budget in milliseconds for every Compile* call.
+   * Token-mask precomputation costs FSM-states x vocab-size; some grammars (e.g. long chains of
+   * optional rules) blow up the state count and would otherwise compile for minutes with no way
+   * to abort. When the budget is exceeded the compile aborts cooperatively and throws
+   * CompileTimeoutError; the partially computed grammar is discarded and the key is not cached,
+   * so a later call may retry (e.g. under a larger timeout). -1 means no timeout.
    */
   GrammarCompiler(
       const TokenizerInfo& tokenizer_info,
       int max_threads = 8,
       bool cache_enabled = true,
-      int64_t max_memory_bytes = -1  // unlimited
+      int64_t max_memory_bytes = -1,   // unlimited
+      int64_t compile_timeout_ms = -1  // no timeout
   );
 
   /*! \brief Get the compiled grammar for a JSON schema string. */

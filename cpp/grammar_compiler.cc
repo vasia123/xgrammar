@@ -6,8 +6,10 @@
 #include <xgrammar/compiler.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -46,7 +48,8 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
           tag_dispatch_rule_id_to_second_slicing_bitset,
       const TokenizerInfo& tokenizer_info,
       std::optional<RuleLevelCache>& rule_level_cache,
-      const bool& need_expand = true
+      const bool& need_expand = true,
+      std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt
   )
       : EarleyParser(grammar, init_state),
         init_rule_id_(init_state.rule_id),
@@ -54,7 +57,8 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
         tag_dispatch_rule_id_to_second_slicing_bitset_(tag_dispatch_rule_id_to_second_slicing_bitset
         ),
         tokenizer_info_(tokenizer_info),
-        rule_level_cache_(rule_level_cache) {}
+        rule_level_cache_(rule_level_cache),
+        deadline_(deadline) {}
   /*!
    * \brief Get the adaptive token mask for the given ParserState.
    * \param is_root_rule Whether to consider the parent rule. If false, there will be
@@ -132,6 +136,24 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
 
   std::optional<RuleLevelCache> rule_level_cache_;
 
+  /*!
+   * \brief The compile deadline, if configured on the GrammarCompiler. The per-token loops in
+   * GetTokenMaskWithFirstCharacterCheck / AdaptCacheWithLookahead check it every 1024 iterations
+   * (a single state's vocab scan can take seconds on a large vocabulary, so checking only
+   * between states would overshoot the deadline by orders of magnitude). Throwing unwinds
+   * before any AddCache call, so a partially computed mask never reaches the rule-level cache.
+   */
+  std::optional<std::chrono::steady_clock::time_point> deadline_;
+
+  /*! \brief Throw CompileTimeoutError if the deadline has passed. Checks the clock once every
+   * 1024 iterations to keep the hot loop cheap. */
+  void ThrowIfDeadlineExceeded(size_t iteration) {
+    if (!deadline_.has_value() || (iteration & 1023) != 0) return;
+    if (std::chrono::steady_clock::now() >= *deadline_) {
+      throw CompileTimeoutError("token mask precomputation exceeded the compile deadline");
+    }
+  }
+
   // Temporary data for GetAdaptiveTokenMask.
   std::vector<int32_t> tmp_accepted_indices_;
   std::vector<int32_t> tmp_rejected_indices_;
@@ -163,7 +185,10 @@ void GrammarMatcherForTokenMaskCache::AdaptCacheWithLookahead(
     if (lookahead_id == -1) {
       return;
     }
+    size_t deadline_check_counter = 0;
     for (const auto& uncertain_index : cache.uncertain_indices) {
+      // uncertain_index is sparse, so a dense counter drives the deadline check cadence.
+      ThrowIfDeadlineExceeded(deadline_check_counter++);
       const auto& token = sorted_decoded_vocab[uncertain_index].second;
       // Many tokens may contain the same prefix, so we will avoid unnecessary matching
       // by finding the longest common prefix with the previous token.
@@ -537,6 +562,7 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
   for (size_t interval_idx = 0; interval_idx < possible_intervals.size(); ++interval_idx) {
     const auto& interval = possible_intervals[interval_idx];
     for (int i = interval.first; i < interval.second; ++i) {
+      ThrowIfDeadlineExceeded(static_cast<size_t>(i));
       // Skip tokens already accepted by token edges (avoid expensive Earley simulation).
       while (skip_ptr < skip_size && token_edge_accepted[skip_ptr] < i) ++skip_ptr;
       if (skip_ptr < skip_size && token_edge_accepted[skip_ptr] == i) continue;
@@ -998,11 +1024,13 @@ class GrammarCompilerSub {
   GrammarCompilerSub(
       const TokenizerInfo& tokenizer_info,
       int max_threads,
-      std::optional<RuleLevelCache> rule_level_cache
+      std::optional<RuleLevelCache> rule_level_cache,
+      int64_t compile_timeout_ms = -1
   )
       : tokenizer_info_(tokenizer_info),
         max_threads_(max_threads),
-        rule_level_cache_(rule_level_cache) {}
+        rule_level_cache_(rule_level_cache),
+        compile_timeout_ms_(compile_timeout_ms) {}
 
   CompiledGrammar CompileBuiltinJSONGrammar();
 
@@ -1043,6 +1071,9 @@ class GrammarCompilerSub {
 
   /*! \brief The manager of the rule level cache.*/
   std::optional<RuleLevelCache> rule_level_cache_;
+
+  /*! \brief Time budget in ms for each MultiThreadCompileGrammar call. -1 means no timeout. */
+  const int64_t compile_timeout_ms_;
 };
 
 CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_unoptimized) {
@@ -1075,21 +1106,40 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
     adaptive_token_mask_cache_mutex.emplace();
   }
 
+  std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt;
+  if (compile_timeout_ms_ >= 0) {
+    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(compile_timeout_ms_);
+  }
+  std::atomic<bool> deadline_exceeded{false};
+
   auto add_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule) {
+    // Once past the deadline, skip the remaining state tasks so the queue drains quickly.
+    if (deadline.has_value() && (deadline_exceeded.load(std::memory_order_relaxed) ||
+                                 std::chrono::steady_clock::now() >= *deadline)) {
+      deadline_exceeded.store(true, std::memory_order_relaxed);
+      return;
+    }
     auto grammar_matcher = GrammarMatcherForTokenMaskCache(
         compiled_grammar_impl->grammar,
         state,
         tag_dispatch_rule_id_to_second_slicing_bitset,
         tokenizer_info_,
         rule_level_cache_,
-        false
+        false,
+        deadline
     );
-    auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
-    if (max_threads_ > 1) {
-      std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
-      compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
-    } else {
-      compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+    try {
+      auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
+      if (max_threads_ > 1) {
+        std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
+        compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+      } else {
+        compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+      }
+    } catch (const CompileTimeoutError&) {
+      // The mask for this state is incomplete: drop it (and everything after it). The throw
+      // happens before any AddCache call, so the rule-level cache is not polluted either.
+      deadline_exceeded.store(true, std::memory_order_relaxed);
     }
   };
 
@@ -1126,6 +1176,13 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
 
   if (max_threads_ > 1) {
     thread_pool->Join();
+  }
+
+  if (deadline_exceeded.load(std::memory_order_relaxed)) {
+    throw CompileTimeoutError(
+        "grammar compilation did not finish within compile_timeout_ms=" +
+        std::to_string(compile_timeout_ms_) + "; the grammar is too complex for this vocabulary"
+    );
   }
 
   return CompiledGrammar(compiled_grammar_impl);
@@ -1317,7 +1374,8 @@ class GrammarCompiler::Impl {
       const TokenizerInfo& tokenizer_info,
       int max_threads,
       bool cache_enabled,
-      int64_t max_memory_bytes
+      int64_t max_memory_bytes,
+      int64_t compile_timeout_ms
   )
       : cache_enabled_(cache_enabled),
         rule_level_cache_(
@@ -1329,7 +1387,7 @@ class GrammarCompiler::Impl {
                   )
                 : std::nullopt
         ),
-        no_cache_compiler_(tokenizer_info, max_threads, rule_level_cache_),
+        no_cache_compiler_(tokenizer_info, max_threads, rule_level_cache_, compile_timeout_ms),
         grammar_level_cache_(
             max_memory_bytes == -1 ? static_cast<std::size_t>(-1)
                                    : static_cast<std::size_t>(max_memory_bytes / 3 * 2),
@@ -1375,6 +1433,21 @@ class GrammarCompiler::Impl {
   using UnionKey = GrammarCompilerCacheKeys::UnionKey;
 
   CompiledGrammar Compute(const UnionKey& key);
+
+  /*!
+   * \brief Look up (or compute) a key in the grammar-level cache. A CompileTimeoutError is a
+   * property of the call, not of the key, so the cached exception is evicted before rethrowing —
+   * a later call (e.g. on a compiler with a larger timeout sharing this cache via serialization,
+   * or simply a retry) gets a fresh compile instead of an instant rethrow forever.
+   */
+  CompiledGrammar GetFromCache(const UnionKey& key) {
+    try {
+      return grammar_level_cache_.Get(key);
+    } catch (const CompileTimeoutError&) {
+      grammar_level_cache_.Remove(key);
+      throw;
+    }
+  }
 
   struct Computer {
     Computer(Impl& compiler) : compiler(compiler) {}
@@ -1433,7 +1506,7 @@ CompiledGrammar GrammarCompiler::Impl::CompileBuiltinJSONGrammar() {
   if (!cache_enabled_) {
     return no_cache_compiler_.CompileBuiltinJSONGrammar();
   }
-  return grammar_level_cache_.Get(BuiltinJSONGrammarKey{});
+  return GetFromCache(BuiltinJSONGrammarKey{});
 }
 
 CompiledGrammar GrammarCompiler::Impl::CompileJSONSchema(
@@ -1449,7 +1522,7 @@ CompiledGrammar GrammarCompiler::Impl::CompileJSONSchema(
         schema, any_whitespace, indent, separators, strict_mode, max_whitespace_cnt
     );
   }
-  return grammar_level_cache_.Get(
+  return GetFromCache(
       SchemaKey{schema, any_whitespace, indent, separators, strict_mode, max_whitespace_cnt}
   );
 }
@@ -1459,21 +1532,21 @@ CompiledGrammar GrammarCompiler::Impl::CompileStructuralTag(const std::string& s
   if (!cache_enabled_) {
     return no_cache_compiler_.CompileStructuralTag(structural_tag_json);
   }
-  return grammar_level_cache_.Get(StructuralTagKey{structural_tag_json});
+  return GetFromCache(StructuralTagKey{structural_tag_json});
 }
 
 CompiledGrammar GrammarCompiler::Impl::CompileRegex(const std::string& regex) {
   if (!cache_enabled_) {
     return no_cache_compiler_.CompileRegex(regex);
   }
-  return grammar_level_cache_.Get(RegexKey{regex});
+  return GetFromCache(RegexKey{regex});
 }
 
 CompiledGrammar GrammarCompiler::Impl::CompileGrammar(const Grammar& grammar) {
   if (!cache_enabled_) {
     return no_cache_compiler_.CompileGrammar(grammar);
   }
-  return grammar_level_cache_.Get(GrammarKey{grammar.ToString(), grammar->GetRootRule().name});
+  return GetFromCache(GrammarKey{grammar.ToString(), grammar->GetRootRule().name});
 }
 
 CompiledGrammar GrammarCompiler::Impl::CompileGrammar(
@@ -1482,7 +1555,7 @@ CompiledGrammar GrammarCompiler::Impl::CompileGrammar(
   if (!cache_enabled_) {
     return no_cache_compiler_.CompileGrammar(ebnf_str, root_rule_name);
   }
-  return grammar_level_cache_.Get(GrammarKey{ebnf_str, root_rule_name});
+  return GetFromCache(GrammarKey{ebnf_str, root_rule_name});
 }
 
 void GrammarCompiler::Impl::ClearCache() {
@@ -1511,10 +1584,12 @@ GrammarCompiler::GrammarCompiler(
     const TokenizerInfo& tokenizer_info,
     int max_threads,
     bool cache_enabled,
-    int64_t max_memory_bytes
+    int64_t max_memory_bytes,
+    int64_t compile_timeout_ms
 )
-    : pimpl_(std::make_shared<Impl>(tokenizer_info, max_threads, cache_enabled, max_memory_bytes)) {
-}
+    : pimpl_(std::make_shared<Impl>(
+          tokenizer_info, max_threads, cache_enabled, max_memory_bytes, compile_timeout_ms
+      )) {}
 
 CompiledGrammar GrammarCompiler::CompileJSONSchema(
     const std::string& schema,

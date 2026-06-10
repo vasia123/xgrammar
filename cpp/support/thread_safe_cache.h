@@ -210,6 +210,12 @@ class LRUCacheImpl {
     entry.index = lru_list_.PushBack(&pair).Index();
   }
 
+  /*! \brief Removes the entry's node from the LRU list. Erasing the map entry is up to the
+   * caller. */
+  void LRURemove(const Entry& entry) {
+    lru_list_.Erase(typename List<std::pair<const Key, Entry>*>::iterator(entry.index, lru_list_));
+  }
+
   /*!
    * \brief Evicts the least recently used nodes until the predicate returns false.
    * \param predicate The function that returns true if eviction should continue.
@@ -304,6 +310,35 @@ class ThreadSafeLRUCache {
             return true;
           }
       );
+  }
+
+  /*!
+   * \brief Removes a key from the cache if its computation has finished.
+   * \return Whether the key was removed.
+   * \details Used to evict entries whose computation failed for reasons that are a property of
+   * the call rather than of the key (e.g. a compile timeout), so that a later call can retry.
+   * An entry that is still being computed by another thread is left in place. Threads already
+   * holding the entry's shared_future are unaffected.
+   */
+  bool Remove(const Key& key) {
+    using namespace std::chrono_literals;
+    const auto lock_map = std::lock_guard{map_mutex_};
+    auto& map = cache_.GetMap();
+    auto it = map.find(key);
+    if (it == map.end()) return false;
+    const auto& future = it->second.value;
+    if (!future.valid() || future.wait_for(0s) != std::future_status::ready) return false;
+    try {
+      current_size_ -= future.get().size;
+    } catch (...) {
+      // the computation threw: it never contributed to current_size_
+    }
+    if (this->max_size_ != kUnlimitedSize) {
+      const auto lock_lru = std::lock_guard{lru_mutex_};
+      cache_.LRURemove(it->second);
+    }
+    map.erase(it);
+    return true;
   }
 
  private:

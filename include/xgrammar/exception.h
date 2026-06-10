@@ -61,6 +61,17 @@ struct InvalidStructuralTagError : XGrammarError {
   std::string GetType() const override { return "InvalidStructuralTagError"; }
 };
 
+/*!
+ * \brief Exception thrown when a grammar compilation exceeds the compile timeout configured on
+ * the GrammarCompiler. The timeout is a property of the call, not of the grammar: the same
+ * grammar may compile fine under a larger timeout (or on a smaller vocabulary).
+ */
+struct CompileTimeoutError : XGrammarError {
+  CompileTimeoutError(const std::string& message)
+      : XGrammarError(std::string("Compile timeout error: ") + message) {}
+  std::string GetType() const override { return "CompileTimeoutError"; }
+};
+
 /************** Union Exceptions **************/
 
 /*!
